@@ -1,0 +1,116 @@
+name: CI/CD Local
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Tests unitaires et d'intégration
+    runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: rootpassword
+          MYSQL_DATABASE: todolist_db
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Installer les dépendances
+        run: npm ci
+
+      - name: Attendre que MySQL soit prêt
+        run: |
+          for i in {1..30}; do
+            mysqladmin ping -h 127.0.0.1 -P 3306 -u root -prootpassword && break
+            echo "En attente de MySQL... ($i)"
+            sleep 2
+          done
+
+      - name: Importer le schéma SQL
+        run: mysql -h 127.0.0.1 -P 3306 -u root -prootpassword todolist_db < scriptSQL.sql
+
+      - name: Exécuter les tests
+        run: npm test
+        env:
+          DB_HOST: 127.0.0.1
+          DB_USER: root
+          DB_PASSWORD: rootpassword
+          DB_NAME: todolist_db
+          DB_PORT: 3306
+
+  build-and-deploy:
+    name: Build, déploiement local et smoke test
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      - name: Build de l'image Docker
+        run: docker build -t projet_devops_backend_image .
+
+      - name: Créer le réseau Docker
+        run: docker network create app-network
+
+      - name: Lancer MySQL
+        run: |
+          docker run -d --name mysql-container \
+            --network app-network \
+            -e MYSQL_ROOT_PASSWORD=rootpassword \
+            -e MYSQL_DATABASE=todolist_db \
+            -p 3306:3306 \
+            mysql:8.0
+
+      - name: Attendre que MySQL soit prêt
+        run: |
+          for i in {1..30}; do
+            docker exec mysql-container mysqladmin ping -h localhost -u root -prootpassword && break
+            echo "En attente de MySQL... ($i)"
+            sleep 2
+          done
+
+      - name: Lancer le conteneur applicatif
+        run: |
+          docker run -d --name backend-container \
+            --network app-network \
+            -e DB_HOST=mysql-container \
+            -e DB_USER=root \
+            -e DB_PASSWORD=rootpassword \
+            -e DB_NAME=todolist_db \
+            -p 3000:3000 \
+            projet_devops_backend_image
+
+      - name: Attendre que l'application démarre
+        run: sleep 10
+
+      - name: Smoke test HTTP
+        run: |
+          curl -f http://localhost:3000 || (docker logs backend-container && exit 1)
+
+      - name: Nettoyage
+        if: always()
+        run: |
+          docker rm -f backend-container mysql-container || true
+          docker network rm app-network || true
